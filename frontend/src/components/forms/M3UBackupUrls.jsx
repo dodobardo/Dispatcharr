@@ -55,7 +55,7 @@ const ResultBadge = ({ result }) => {
 const M3UBackupUrls = ({ value, onChange, getTestValues, accountId }) => {
   const [results, setResults] = useState({});
   const [testing, setTesting] = useState(false);
-  const [testedPrimary, setTestedPrimary] = useState('');
+  const [testedUrls, setTestedUrls] = useState([]);
 
   const update = (next) => onChange(next);
 
@@ -73,7 +73,7 @@ const M3UBackupUrls = ({ value, onChange, getTestValues, accountId }) => {
     if (urls.length === 0) return;
 
     setTesting(true);
-    setTestedPrimary((server_url || '').trim());
+    setTestedUrls(urls);
     setResults(Object.fromEntries(urls.map((url) => [url, { pending: true }])));
     try {
       const response = await API.testM3UServerUrls({
@@ -94,22 +94,9 @@ const M3UBackupUrls = ({ value, onChange, getTestValues, accountId }) => {
   return (
     <Input.Wrapper
       label="Backup URLs"
-      description="Other addresses of the same provider. Used if the primary fails during refresh, and during playback a stream that fails or keeps buffering is tried on each server before switching to the next stream."
+      description="Other addresses of the same provider, tried in order when the primary is down or a stream fails or keeps buffering."
     >
       <Stack gap={6} mt={6}>
-        {testedPrimary && results[testedPrimary] && (
-          <Group gap="xs" wrap="nowrap">
-            <Text
-              size="xs"
-              c="dimmed"
-              style={{ flex: 1, minWidth: 0 }}
-              truncate
-            >
-              Primary: {testedPrimary}
-            </Text>
-            <ResultBadge result={results[testedPrimary]} />
-          </Group>
-        )}
         {value.map((url, index) => (
           <Group key={index} gap={4} wrap="nowrap" align="center">
             <TextInput
@@ -123,8 +110,6 @@ const M3UBackupUrls = ({ value, onChange, getTestValues, accountId }) => {
               aria-label={serverLabel(index + 1)}
               value={url}
               onChange={(event) => setUrl(index, event.currentTarget.value)}
-              rightSection={<ResultBadge result={results[url.trim()]} />}
-              rightSectionWidth={results[url.trim()] ? 110 : undefined}
             />
             <ActionIcon
               variant="subtle"
@@ -174,6 +159,23 @@ const M3UBackupUrls = ({ value, onChange, getTestValues, accountId }) => {
             Test URLs
           </Button>
         </Group>
+        {testedUrls.length > 0 && (
+          <Stack gap={4}>
+            {testedUrls.map((url, index) => (
+              <Group key={url} gap="xs" wrap="nowrap">
+                <Text size="xs" c="dimmed" w={70} style={{ flexShrink: 0 }}>
+                  {serverLabel(index).replace(' URL', '')}
+                </Text>
+                <Tooltip label={url}>
+                  <Text size="xs" truncate style={{ flex: 1, minWidth: 0 }}>
+                    {url}
+                  </Text>
+                </Tooltip>
+                <ResultBadge result={results[url]} />
+              </Group>
+            ))}
+          </Stack>
+        )}
       </Stack>
     </Input.Wrapper>
   );
