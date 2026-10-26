@@ -1,0 +1,313 @@
+# Fork: keep main in sync with upstream Dispatcharr.
+#
+# Every 6 hours (or on demand) upstream main is merged into this fork's main.
+#  - Clean merge and all checks pass  -> pushed to main -> fork-deploy.yml
+#    publishes a new image.
+#  - Conflicts, or checks fail after merging -> Claude resolves/fixes the merge
+#    in CI, keeping both upstream's changes and the fork features listed in
+#    .github/fork/CUSTOMIZATIONS.md, and must get .github/fork/verify.sh green.
+#    If it does, the merge is pushed and deployed like any other.
+#  - Still failing -> the work-in-progress merge is pushed to a sync/upstream-*
+#    branch, a pull request is opened for you, and this run fails (GitHub
+#    emails you). main and the deployed image are left untouched.
+#
+# Required repository secrets:
+#   SYNC_TOKEN               Fine-grained PAT for this repo with
+#                            "Contents: read and write" and
+#                            "Workflows: read and write". Needed because
+#                            upstream merges can touch .github/workflows and
+#                            because pushes made with GITHUB_TOKEN would not
+#                            trigger the deploy workflow.
+#   CLAUDE_CODE_OAUTH_TOKEN  From `claude setup-token` (uses your Claude plan),
+#     or ANTHROPIC_API_KEY   an API key from console.anthropic.com.
+name: "Fork: sync upstream"
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: Upstream branch to merge
+        default: main
+        required: true
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: https://github.com/Dispatcharr/Dispatcharr.git
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+
+jobs:
+  sync:
+    if: github.repository != 'Dispatcharr/Dispatcharr'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: dispatcharr
+          POSTGRES_USER: dispatch
+          POSTGRES_PASSWORD: secret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dispatch" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - name: Check secrets
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Missing secret SYNC_TOKEN (see the header of this workflow)."
+            exit 1
+          fi
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::No CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY: conflicts will be handed to you as a pull request instead of resolved by Claude."
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${upstream_sha::7}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Already up to date with upstream $UPSTREAM_BRANCH (${upstream_sha::7})."
+            echo "state=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Upstream commits to merge:"
+          git log --oneline "HEAD..$upstream_sha" | head -50
+
+          if git merge --no-ff --no-commit "$upstream_sha"; then
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=conflict" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U | tee "$RUNNER_TEMP/conflicts.txt"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.merge.outputs.state != 'up-to-date'
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        if: steps.merge.outputs.state != 'up-to-date'
+        with:
+          node-version: "24"
+
+      - name: Install Python dependencies
+        if: steps.merge.outputs.state != 'up-to-date'
+        # Use the fork's script even if the merge is mid-conflict.
+        run: |
+          git show HEAD:.github/fork/install-python-deps.sh > "$RUNNER_TEMP/install-python-deps.sh"
+          bash "$RUNNER_TEMP/install-python-deps.sh" \
+            || echo "::warning::Dependency install failed (pyproject may be conflicted); Claude will retry it."
+
+      - name: Verify clean merge
+        id: verify_clean
+        if: steps.merge.outputs.state == 'clean'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          .github/fork/verify.sh all 2>&1 | tee "$RUNNER_TEMP/verify.log"
+
+      - name: Prepare Claude context
+        id: claude_ctx
+        if: >-
+          steps.merge.outputs.state == 'conflict' ||
+          steps.verify_clean.outcome == 'failure'
+        env:
+          HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          echo "enabled=$HAS_CLAUDE" >> "$GITHUB_OUTPUT"
+          if [ -s "$RUNNER_TEMP/conflicts.txt" ]; then
+            {
+              echo "The merge stopped with conflicts in these files:"
+              sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt"
+            } > "$RUNNER_TEMP/situation.md"
+          else
+            {
+              echo "The merge applied without textual conflicts, but .github/fork/verify.sh failed."
+              echo "The last 150 lines of its output are in $RUNNER_TEMP/verify-tail.log"
+            } > "$RUNNER_TEMP/situation.md"
+            tail -n 150 "$RUNNER_TEMP/verify.log" > "$RUNNER_TEMP/verify-tail.log" || true
+          fi
+          {
+            echo 'situation<<EOF'
+            cat "$RUNNER_TEMP/situation.md"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude resolves the merge
+        id: claude
+        if: steps.claude_ctx.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: |
+            --allowedTools "Bash,Read,Edit,MultiEdit,Write,Glob,Grep,TodoWrite"
+            --max-turns 200
+          prompt: |
+            You are maintaining ${{ github.repository }}, a fork of Dispatcharr/Dispatcharr
+            (Django backend + React/Vite frontend) that carries its own features on top of upstream.
+
+            A merge of upstream ${{ env.UPSTREAM_BRANCH }} (${{ steps.merge.outputs.upstream_sha }})
+            into the fork's main is in progress in the current working tree (MERGE_HEAD is set).
+
+            ${{ steps.claude_ctx.outputs.situation }}
+
+            Your job: finish this merge so that `.github/fork/verify.sh all` passes, keeping BOTH
+            upstream's changes AND the fork's features. Read `.github/fork/CUSTOMIZATIONS.md` first:
+            it lists every fork feature, the files involved, and how they hook into upstream code.
+
+            How to resolve:
+            - Treat upstream as the base. Take upstream's version of conflicting code, then
+              re-apply the fork feature on top of it (new hooks, extra arguments, extra fields).
+              Never delete or weaken upstream functionality to make the fork code fit, and never
+              drop a fork feature. If upstream now implements the same thing natively, prefer
+              upstream's implementation and adapt the fork code to it, and say so in your summary.
+            - Upstream may have added new code paths that need the fork hook too (for example a
+              new `XCClient(` call that should pass `backup_urls=`). Check for those.
+            - Django migrations: never rename, renumber, or edit migrations that already exist on
+              either side (they are applied on the live database). If two leaf migrations conflict
+              in an app, run `python manage.py makemigrations --merge --noinput` for that app.
+            - Lockfiles (frontend/package-lock.json): take upstream's, then run
+              `cd frontend && npm install --no-audit --no-fund` only if the fork added packages.
+            - Postgres and Redis are running and the environment variables for them are set by
+              verify.sh. Python deps may need `bash .github/fork/install-python-deps.sh` if
+              pyproject.toml changed. Iterate with targeted tests first (for example
+              `python manage.py test apps.m3u apps.proxy --noinput`,
+              `cd frontend && npx vitest --run src/components/forms`), then run
+              `.github/fork/verify.sh all` and keep fixing until it passes.
+            - Update `.github/fork/CUSTOMIZATIONS.md` if file names or hook points changed.
+
+            Rules:
+            - Do NOT run `git commit`, `git merge --abort`, `git reset`, `git checkout <branch>`,
+              `git rebase`, `git stash` or `git push`. The workflow commits and pushes.
+              Stage resolved files with `git add`.
+            - When done, `git diff --name-only --diff-filter=U` must print nothing and no file may
+              contain conflict markers.
+            - Finally write a short summary of what conflicted and how you resolved it to
+              `${{ runner.temp }}/claude-summary.md`.
+
+      - name: Verify after Claude
+        id: verify_claude
+        if: steps.claude_ctx.outputs.enabled == 'true'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Unresolved conflicts remain:"; git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)' -- . ; then
+            echo "::error::Conflict markers left in files"
+            exit 1
+          fi
+          .github/fork/verify.sh all 2>&1 | tee "$RUNNER_TEMP/verify-final.log"
+
+      - name: Commit and push to main
+        id: push
+        if: >-
+          steps.merge.outputs.state != 'up-to-date' &&
+          (steps.verify_clean.outcome == 'success' || steps.verify_claude.outcome == 'success')
+        env:
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+          RESOLVED_BY_CLAUDE: ${{ steps.verify_claude.outcome == 'success' }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          # The Claude step may have changed git auth; push with SYNC_TOKEN so
+          # workflow-file changes are allowed and the deploy workflow triggers.
+          git config --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git add -A
+            {
+              echo "Merge upstream Dispatcharr $UPSTREAM_BRANCH (${UPSTREAM_SHA::7})"
+              if [ "$RESOLVED_BY_CLAUDE" = "true" ]; then
+                echo
+                echo "Conflicts/breakage resolved by Claude in CI (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+                [ -s "$RUNNER_TEMP/claude-summary.md" ] && { echo; cat "$RUNNER_TEMP/claude-summary.md"; }
+              fi
+            } > "$RUNNER_TEMP/commit-msg.txt"
+            git commit -F "$RUNNER_TEMP/commit-msg.txt"
+          fi
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD || { echo "::error::Upstream commit missing from result"; exit 1; }
+          git push origin HEAD:main
+          {
+            echo "### Merged upstream ${UPSTREAM_SHA::7} into main"
+            [ "$RESOLVED_BY_CLAUDE" = "true" ] && [ -s "$RUNNER_TEMP/claude-summary.md" ] && cat "$RUNNER_TEMP/claude-summary.md"
+            echo
+            echo "The deploy workflow will now publish a new image."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand over to you
+        if: >-
+          steps.merge.outputs.state != 'up-to-date' &&
+          steps.push.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHORT: ${{ steps.merge.outputs.upstream_short }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          # The Claude step may have changed git auth; push with SYNC_TOKEN so
+          # workflow-file changes are allowed and the deploy workflow triggers.
+          git config --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          branch="sync/upstream-$UPSTREAM_SHORT"
+          git add -A
+          git commit -q --no-verify -m "WIP: merge upstream Dispatcharr ($UPSTREAM_SHORT), needs manual fixes" || true
+          git push -f origin "HEAD:refs/heads/$branch"
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            echo "Automatic merge of upstream \`$UPSTREAM_SHORT\` could not be completed."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            cat "$RUNNER_TEMP/situation.md" 2>/dev/null || true
+            if [ -s "$RUNNER_TEMP/claude-summary.md" ]; then
+              echo; echo "### Claude's notes"; cat "$RUNNER_TEMP/claude-summary.md"
+            fi
+            echo
+            echo "This branch may contain conflict markers. Fix it, then merge this PR; the deploy workflow publishes the image."
+          } > "$body"
+          gh pr create --base main --head "$branch" \
+            --title "Upstream sync $UPSTREAM_SHORT needs attention" --body-file "$body" \
+            || gh pr edit "$branch" --body-file "$body" \
+            || echo "::warning::Could not open a PR (allow Actions to create PRs in Settings > Actions > General)."
+          echo "::error::Upstream merge needs manual attention: branch $branch"
+          exit 1
