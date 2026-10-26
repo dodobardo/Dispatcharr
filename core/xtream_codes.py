@@ -26,10 +26,26 @@ def normalize_server_url(url):
 
 
 class Client:
-    """Xtream Codes API Client with robust error handling"""
+    """Xtream Codes API Client with robust error handling.
 
-    def __init__(self, server_url, username, password, user_agent=None):
+    ``backup_urls`` are other addresses of the same provider. When a request to
+    the current server fails, the same request is retried on the next one and
+    the client stays on whichever server answered.
+    """
+
+    def __init__(self, server_url, username, password, user_agent=None, backup_urls=None):
         self.server_url = self._normalize_url(server_url)
+        # The configured primary; stream URLs stored in the DB are built from it
+        # so stream identity does not depend on which server answered a refresh.
+        self.primary_server_url = self.server_url
+        self.server_urls = [self.server_url]
+        for url in backup_urls or []:
+            try:
+                normalized = self._normalize_url(url)
+            except ValueError:
+                continue
+            if normalized not in self.server_urls:
+                self.server_urls.append(normalized)
         self.username = username
         self.password = password
         self.user_agent = user_agent
@@ -54,7 +70,8 @@ class Client:
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=1,
             pool_maxsize=2,
-            max_retries=3,
+            # With backups, move on to the next server instead of retrying a dead one
+            max_retries=1 if len(self.server_urls) > 1 else 3,
             pool_block=False
         )
         self.session.mount('http://', adapter)
@@ -69,6 +86,31 @@ class Client:
         return normalized
 
     def _make_request(self, endpoint, params=None):
+        """Make request, failing over to backup servers when configured"""
+        if len(self.server_urls) == 1:
+            return self._request_once(endpoint, params)
+
+        start = self.server_urls.index(self.server_url) if self.server_url in self.server_urls else 0
+        first_error = None
+        for offset in range(len(self.server_urls)):
+            server_url = self.server_urls[(start + offset) % len(self.server_urls)]
+            if offset:
+                logger.warning(
+                    f"XC failover: trying server {server_url} "
+                    f"({offset + 1}/{len(self.server_urls)})"
+                )
+            self.server_url = server_url
+            try:
+                return self._request_once(endpoint, params)
+            except Exception as e:
+                # A rejected login is the same on every mirror; don't hammer them
+                if isinstance(e, ValueError) and str(e).startswith("XC API Error"):
+                    raise
+                first_error = first_error or e
+        self.server_url = self.server_urls[start]
+        raise first_error
+
+    def _request_once(self, endpoint, params=None):
         """Make request with detailed error handling"""
         try:
             url = f"{self.server_url}/{endpoint}"
@@ -275,15 +317,15 @@ class Client:
 
     def get_stream_url(self, stream_id):
         """Get the playback URL for a stream"""
-        return f"{self.server_url}/live/{self.username}/{self.password}/{stream_id}.ts"
+        return f"{self.primary_server_url}/live/{self.username}/{self.password}/{stream_id}.ts"
 
     def get_episode_stream_url(self, stream_id, container_extension='mp4'):
         """Get the playback URL for an episode stream"""
-        return f"{self.server_url}/series/{self.username}/{self.password}/{stream_id}.{container_extension}"
+        return f"{self.primary_server_url}/series/{self.username}/{self.password}/{stream_id}.{container_extension}"
 
     def get_vod_stream_url(self, stream_id, container_extension='mp4'):
         """Get the playback URL for a VOD stream"""
-        return f"{self.server_url}/movie/{self.username}/{self.password}/{stream_id}.{container_extension}"
+        return f"{self.primary_server_url}/movie/{self.username}/{self.password}/{stream_id}.{container_extension}"
 
     def get_vod_categories(self):
         """Get VOD categories"""

@@ -16,8 +16,14 @@ from ..utils import detect_stream_type, get_logger, signal_process_tree
 from ..redis_keys import RedisKeys
 from ..constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE
 from ..config_helper import ConfigHelper
-from ..url_utils import get_alternate_streams, get_stream_info_for_switch, get_stream_object
+from ..url_utils import (
+    get_alternate_streams,
+    get_server_failover_candidates,
+    get_stream_info_for_switch,
+    get_stream_object,
+)
 from ..utils import resolve_channel_display_name
+from apps.m3u.server_urls import remember_working_server_url, url_origin
 
 logger = get_logger()
 
@@ -105,6 +111,14 @@ class StreamManager:
         # Add tracking for tried streams and current stream
         self.current_stream_id = stream_id
         self.tried_stream_ids = set()
+
+        # Backup server URLs of the current stream's M3U account already tried
+        # for this stream. A stream is tried on every server of its account
+        # before moving on to the channel's next stream.
+        self.tried_server_urls = set()
+        # (account_id, primary_server_url, server_url) after a server failover,
+        # remembered as the account's preferred server once data flows.
+        self._pending_working_server = None
 
         # Full-list exhaustion wraps (capped by MAX_STREAM_SWITCHES).
         self._failover_rotation_passes = 0
@@ -213,6 +227,7 @@ class StreamManager:
 
     def _note_stable_connection(self):
         """Reset stream-switch bookkeeping after sustained successful playback."""
+        self.tried_server_urls = set()
         if self.current_stream_id:
             self.tried_stream_ids = {self.current_stream_id}
         else:
@@ -1441,6 +1456,7 @@ class StreamManager:
                     if self._connection_is_awaiting_data():
                         self._connection_awaiting_data = False
                         self._startup_failover_exhausted = False
+                        self._remember_working_server()
                 else:
                     # fetch_chunk() returned False - could be timeout, no data, or error
                     if not self.running:
@@ -1536,7 +1552,8 @@ class StreamManager:
                 logger.debug(f"Error flushing final bitrate to DB for channel {self.channel_id}: {e}")
 
     def update_url(self, new_url, stream_id=None, m3u_profile_id=None, reason=None,
-                   previous_stream_name=None, previous_provider_name=None):
+                   previous_stream_name=None, previous_provider_name=None,
+                   server_url=None):
         """Update stream URL and reconnect with proper cleanup for both HTTP and transcode sessions.
 
         reason (buffering_timeout, max_retries_exceeded, health_monitor or manual;
@@ -1545,6 +1562,8 @@ class StreamManager:
         previous_provider_name describe the stream being left; failover passes
         them from the alternate-stream lookup, while manual switches fall back
         to the stream_name still held in the channel metadata hash.
+        server_url is set when only the provider server changes (backup URL
+        failover) and is recorded on the event.
         """
         if new_url == self.url:
             logger.info(f"URL unchanged: {new_url}")
@@ -1632,6 +1651,8 @@ class StreamManager:
                 # New stream gets its own buffering_timeout channel_error chance
                 if stream_id != previous_stream_id:
                     self.buffering_timeout_error_stream_id = self._NO_BUFFERING_TIMEOUT_ERROR
+                    self.tried_server_urls = set()
+                    self._pending_working_server = None
 
             # Reset retry counter to allow immediate reconnect
             self._clear_connection_failure_history()
@@ -1663,6 +1684,7 @@ class StreamManager:
                         previous_provider_name=previous_provider_name,
                         stream_id=stream_id,
                         new_url=new_url[:100] if new_url else None,
+                        server=url_origin(server_url) if server_url else None,
                     ),
                 )
             except Exception as e:
@@ -2243,6 +2265,17 @@ class StreamManager:
         """
         if previous_stream_info is None:
             previous_stream_info = {}
+
+        # Same stream on another server of the provider first, like M3U profiles.
+        try:
+            if self._try_next_server_url(reason=reason):
+                return True
+        except Exception as e:
+            logger.error(
+                f"Error trying backup server URL for channel {self.channel_id}: {e}",
+                exc_info=True,
+            )
+
         try:
             logger.info(f"Trying to find alternative stream for channel {self.channel_id}, current stream ID: {self.current_stream_id}")
 
@@ -2397,6 +2430,92 @@ class StreamManager:
         except Exception as e:
             logger.error(f"Error trying next stream for channel {self.channel_id}: {e}", exc_info=True)
             return False
+
+    def _current_m3u_profile_id(self):
+        redis_client = getattr(getattr(self, 'buffer', None), 'redis_client', None)
+        if not redis_client:
+            return None
+        try:
+            value = self._decode_redis_value(
+                redis_client.hget(
+                    RedisKeys.channel_metadata(self.channel_id),
+                    ChannelMetadataField.M3U_PROFILE,
+                )
+            )
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
+        except Exception as e:
+            logger.debug(f"Could not read M3U profile for channel {self.channel_id}: {e}")
+            return None
+
+    def _try_next_server_url(self, reason=None):
+        """Switch the current stream to the next backup server URL of its M3U account.
+
+        Returns True when the URL was switched. False when the account has no
+        backup URLs or every server was already tried for this stream, in
+        which case the caller moves on to the next stream.
+        """
+        if not self.current_stream_id:
+            return False
+        m3u_profile_id = self._current_m3u_profile_id()
+        if not m3u_profile_id:
+            return False
+
+        lookup = get_server_failover_candidates(self.current_stream_id, m3u_profile_id)
+        if not lookup:
+            return False
+        account_id, primary_server_url, candidates = lookup
+        if len(candidates) < 2:
+            return False
+
+        tried_server_urls = getattr(self, 'tried_server_urls', None)
+        if tried_server_urls is None:
+            tried_server_urls = self.tried_server_urls = set()
+        tried_server_urls.add(self.url)
+        for server_url, url in candidates:
+            if url == self.url or url in tried_server_urls:
+                continue
+            tried_server_urls.add(url)
+
+            logger.warning(
+                f"Trying stream {self.current_stream_id} on server "
+                f"{url_origin(server_url)} for channel {self.channel_id} "
+                f"(reason: {reason or 'unknown'})"
+            )
+            if not self.update_url(
+                url, self.current_stream_id, m3u_profile_id, reason=reason,
+                server_url=server_url,
+            ):
+                continue
+
+            self._pending_working_server = (account_id, primary_server_url, server_url)
+
+            if hasattr(self.buffer, 'redis_client') and self.buffer.redis_client:
+                self.buffer.redis_client.hset(
+                    RedisKeys.channel_metadata(self.channel_id),
+                    mapping={
+                        ChannelMetadataField.URL: url,
+                        ChannelMetadataField.STREAM_SWITCH_TIME: str(time.time()),
+                        ChannelMetadataField.STREAM_SWITCH_REASON: reason or "unknown",
+                    },
+                )
+            return True
+
+        logger.info(
+            f"All {len(candidates)} servers tried for stream {self.current_stream_id} "
+            f"on channel {self.channel_id}"
+        )
+        return False
+
+    def _remember_working_server(self):
+        """Once a failed-over server delivers data, prefer it for new connections."""
+        pending = getattr(self, '_pending_working_server', None)
+        if not pending:
+            return
+        self._pending_working_server = None
+        account_id, primary_server_url, server_url = pending
+        remember_working_server_url(account_id, primary_server_url, server_url)
 
     # Add a new helper method to safely reset the URL switching state
     def _reset_url_switching_state(self):

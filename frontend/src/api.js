@@ -1599,6 +1599,17 @@ export default class API {
     }
   }
 
+  static async testM3UServerUrls(values) {
+    try {
+      return await request(`${host}/api/m3u/accounts/test-server-urls/`, {
+        method: 'POST',
+        body: values,
+      });
+    } catch (e) {
+      errorNotification('Failed to test server URLs', e);
+    }
+  }
+
   static async refreshPlaylist(id) {
     try {
       const response = await request(`${host}/api/m3u/refresh/${id}/`, {

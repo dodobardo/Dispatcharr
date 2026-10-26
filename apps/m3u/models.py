@@ -36,6 +36,15 @@ class M3UAccount(models.Model):
         null=True,
         help_text="The base URL of the M3U server (optional if a file is uploaded)",
     )
+    backup_server_urls = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Ordered list of backup server URLs for the same provider. Used when "
+            "the primary URL is unreachable during refresh, and tried per stream "
+            "before switching to another stream during playback."
+        ),
+    )
     file_path = models.CharField(max_length=255, blank=True, null=True)
     server_group = models.ForeignKey(
         "ServerGroup",

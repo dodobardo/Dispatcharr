@@ -59,6 +59,18 @@ vi.mock('../M3UProfiles', () => ({
   ),
 }));
 
+vi.mock('../M3UBackupUrls', () => ({
+  default: ({ value, onChange }) => (
+    <div data-testid="m3u-backup-urls">
+      <span data-testid="backup-url-count">{value.length}</span>
+      <button
+        data-testid="push-backup-url"
+        onClick={() => onChange([...value, 'http://backup:8080'])}
+      />
+    </div>
+  ),
+}));
+
 vi.mock('../M3UGroupFilter', () => ({
   default: ({ onChange }) => (
     <div data-testid="m3u-group-filter">
@@ -790,6 +802,45 @@ describe('M3U', () => {
       fireEvent.click(screen.getByRole('button', { name: /update|save/i }));
       await waitFor(() => {
         expect(onClose).toHaveBeenCalled();
+      });
+    });
+  });
+
+  // ── Backup server URLs ─────────────────────────────────────────────────────
+
+  describe('backup server URLs', () => {
+    it('loads the account backup URLs into the editor', () => {
+      setupStores();
+      render(
+        <M3U
+          {...defaultProps({
+            m3uAccount: makeM3uAccount({
+              backup_server_urls: ['http://b1:8080', 'http://b2:8080'],
+            }),
+          })}
+        />
+      );
+      expect(screen.getByTestId('backup-url-count')).toHaveTextContent('2');
+    });
+
+    it('submits the edited backup URLs', async () => {
+      setupStores();
+      render(
+        <M3U
+          {...defaultProps({
+            m3uAccount: makeM3uAccount({ backup_server_urls: [] }),
+          })}
+        />
+      );
+      fireEvent.click(screen.getByTestId('push-backup-url'));
+      fireEvent.click(screen.getByRole('button', { name: /update|save/i }));
+      await waitFor(() => {
+        expect(M3uUtils.prepareSubmitValues).toHaveBeenCalledWith(
+          expect.objectContaining({
+            backup_server_urls: ['http://backup:8080'],
+          }),
+          null
+        );
       });
     });
   });

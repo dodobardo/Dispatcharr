@@ -427,6 +427,76 @@ class M3UAccountViewSet(viewsets.ModelViewSet):
         },
     )
     @action(
+        detail=False,
+        methods=["post"],
+        url_path="test-server-urls",
+        permission_classes=[IsAdmin],
+    )
+    def test_server_urls(self, request):
+        """
+        Check that each server URL of an account answers, and how fast.
+
+        Body: ``urls`` (list), ``account_type`` ("XC" or "STD"), ``username``,
+        ``password``, ``user_agent`` (id) and optionally ``account_id``. When
+        editing an existing account the form leaves the password blank, so the
+        stored password and user agent of ``account_id`` are used as fallback.
+
+        Returns ``{"results": [{"url", "success", "response_time_ms", "error"}]}``
+        in the same order as ``urls``.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from .server_urls import MAX_BACKUP_SERVER_URLS, parse_server_url_list
+        from .server_url_checks import check_server_url
+
+        urls = parse_server_url_list(request.data.get("urls"))
+        if not urls:
+            return Response(
+                {"error": "No URLs provided"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if len(urls) > MAX_BACKUP_SERVER_URLS + 1:
+            return Response(
+                {"error": f"Too many URLs (maximum {MAX_BACKUP_SERVER_URLS + 1})"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        account = None
+        account_id = request.data.get("account_id")
+        if account_id:
+            account = M3UAccount.objects.filter(id=account_id).first()
+
+        account_type = request.data.get("account_type") or (
+            account.account_type if account else M3UAccount.Types.STADNARD
+        )
+        username = request.data.get("username") or (account.username if account else "")
+        password = request.data.get("password") or (account.password if account else "")
+
+        user_agent = None
+        user_agent_id = request.data.get("user_agent")
+        if user_agent_id not in (None, "", "0", 0):
+            ua = UserAgent.objects.filter(id=user_agent_id).first()
+            if ua:
+                user_agent = ua.user_agent
+        if not user_agent:
+            user_agent = (
+                account.get_user_agent_string() if account
+                else "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            )
+
+        def run(url):
+            return check_server_url(
+                url,
+                account_type=account_type,
+                username=username,
+                password=password,
+                user_agent=user_agent,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(len(urls), 6)) as pool:
+            results = list(pool.map(run, urls))
+
+        return Response({"results": results})
+
+    @action(
         detail=True,
         methods=["get"],
         url_path="auto-created-channels-count",

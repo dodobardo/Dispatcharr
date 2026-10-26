@@ -1,4 +1,5 @@
 # apps/m3u/tasks.py
+import contextvars
 import logging
 import re
 import regex
@@ -33,6 +34,7 @@ from core.models import CoreSettings
 from core.xtream_codes import Client as XCClient
 from core.utils import send_websocket_update
 from apps.m3u.credentials import get_transformed_credentials
+from apps.m3u.server_urls import get_account_server_urls, make_stream_url_canonicalizer
 from .utils import (
     convert_js_numbered_backreferences,
     normalize_stream_url,
@@ -115,6 +117,10 @@ def _get_active_m3u_account(account_id):
     )
 
 
+# Set while fetching from a server URL that still has backups after it.
+_suppress_m3u_error_notify = contextvars.ContextVar("suppress_m3u_error_notify", default=False)
+
+
 def _set_m3u_account_status(
     account_id,
     status,
@@ -126,6 +132,9 @@ def _set_m3u_account_status(
     ws_error=None,
 ):
     """Update account status using a fresh connection (safe after DB failures)."""
+    if _suppress_m3u_error_notify.get():
+        # A backup server URL will be tried next; only the final failure notifies
+        notify_error = False
     _release_task_db_connection()
     update = {"status": status}
     if last_message is not None:
@@ -195,7 +204,49 @@ def fetch_m3u_lines(account, use_cache=False):
     On success returns ``(source, True)`` where *source* is either a filesystem
     path (streamed during parse) or, for ZIP uploads only, an in-memory line
     list. Failures return ``(None, False)``.
+
+    When the account has backup server URLs, each one is tried in turn until a
+    download succeeds.
     """
+    server_urls = get_account_server_urls(account)
+    if len(server_urls) < 2 or account.file_path and not account.server_url:
+        return _fetch_m3u_lines_from_server(account, use_cache)
+
+    primary_url = account.server_url
+    try:
+        for index, url in enumerate(server_urls):
+            if index:
+                logger.warning(
+                    f"M3U failover for account {account.name}: trying backup URL "
+                    f"{index}/{len(server_urls) - 1}"
+                )
+                send_m3u_update(
+                    account.id,
+                    "downloading",
+                    0,
+                    status="fetching",
+                    message=f"Server {index} failed, trying backup URL {index} of {len(server_urls) - 1}...",
+                )
+            # In-memory only: the fetch path saves status fields, never server_url.
+            account.server_url = url
+            token = _suppress_m3u_error_notify.set(index < len(server_urls) - 1)
+            try:
+                source, success = _fetch_m3u_lines_from_server(account, use_cache)
+            finally:
+                _suppress_m3u_error_notify.reset(token)
+            if success:
+                if index:
+                    logger.info(f"M3U account {account.name} fetched from backup URL {index}")
+                return source, success
+            # The cached file only applies to the first attempt
+            use_cache = False
+        return None, False
+    finally:
+        account.server_url = primary_url
+
+
+def _fetch_m3u_lines_from_server(account, use_cache=False):
+    """Fetch the playlist from ``account.server_url`` (or the uploaded file)."""
     os.makedirs(m3u_dir, exist_ok=True)
     file_path = os.path.join(m3u_dir, f"{account.id}.m3u")
 
@@ -964,10 +1015,11 @@ def collect_xc_streams(account_id, enabled_groups):
             account.username,
             account.password,
             account.get_user_agent_string(),
+            backup_urls=account.backup_server_urls,
         ) as xc_client:
 
             stream_url_prefix = (
-                f"{xc_client.server_url.rstrip('/')}/live/"
+                f"{xc_client.primary_server_url.rstrip('/')}/live/"
                 f"{xc_client.username}/{xc_client.password}/"
             )
 
@@ -1133,6 +1185,7 @@ def process_xc_category_direct(account_id, batch, groups, hash_keys):
             account.username,
             account.password,
             account.get_user_agent_string(),
+            backup_urls=account.backup_server_urls,
         ) as xc_client:
             # Log the batch details to help with debugging
             logger.debug(f"Processing XC batch: {batch}")
@@ -1793,7 +1846,8 @@ def refresh_m3u_groups(account_id, use_cache=False, full_refresh=False, scan_sta
             # Create XCClient with explicit error handling
             try:
                 with XCClient(
-                    account.server_url, account.username, account.password, user_agent_string
+                    account.server_url, account.username, account.password, user_agent_string,
+                    backup_urls=account.backup_server_urls,
                 ) as xc_client:
                     logger.info(f"XCClient instance created successfully")
 
@@ -1910,6 +1964,7 @@ def refresh_m3u_groups(account_id, use_cache=False, full_refresh=False, scan_sta
             return account.last_message or f"Failed to fetch M3U data for account_id={account_id}.", None
 
         valid_stream_count = 0
+        canonicalize_url = make_stream_url_canonicalizer(account)
 
         if isinstance(source, str):
             logger.debug(f"Streaming M3U parse from {source}")
@@ -1917,6 +1972,8 @@ def refresh_m3u_groups(account_id, use_cache=False, full_refresh=False, scan_sta
                 entry_iter = iter_m3u_entries(m3u_file)
                 for entry in entry_iter:
                     valid_stream_count += 1
+                    if canonicalize_url:
+                        entry["url"] = canonicalize_url(entry["url"])
                     group_title_attr = get_case_insensitive_attr(entry["attributes"], "group-title", "")
                     if group_title_attr and group_title_attr not in groups:
                         logger.debug(f"Found new group for M3U account {account_id}: '{group_title_attr}'")
@@ -1932,6 +1989,8 @@ def refresh_m3u_groups(account_id, use_cache=False, full_refresh=False, scan_sta
             try:
                 for entry in iter_m3u_entries(source):
                     valid_stream_count += 1
+                    if canonicalize_url:
+                        entry["url"] = canonicalize_url(entry["url"])
                     group_title_attr = get_case_insensitive_attr(entry["attributes"], "group-title", "")
                     if group_title_attr and group_title_attr not in groups:
                         logger.debug(f"Found new group for M3U account {account_id}: '{group_title_attr}'")
@@ -3338,7 +3397,8 @@ def refresh_account_profiles(account_id):
                     profile_url,
                     profile_username,
                     profile_password,
-                    user_agent_string
+                    user_agent_string,
+                    backup_urls=account.backup_server_urls,
                 ) as profile_client:
                     # Authenticate with this profile's credentials
                     if profile_client.authenticate():
@@ -3420,6 +3480,7 @@ def refresh_account_info(profile_id):
             transformed_username,
             transformed_password,
             account.get_user_agent_string(),
+            backup_urls=account.backup_server_urls,
         )        # Authenticate and get account info
         auth_result = client.authenticate()
         if not auth_result:

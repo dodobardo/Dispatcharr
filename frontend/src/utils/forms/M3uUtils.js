@@ -1,5 +1,30 @@
 import API from '../../api.js';
 
+export const MAX_BACKUP_SERVER_URLS = 10;
+
+/**
+ * Trim backup URLs and drop blanks and duplicates, keeping order.
+ * @param {string[]|null|undefined} urls
+ * @returns {string[]}
+ */
+export const cleanBackupUrls = (urls) => {
+  const seen = new Set();
+  return (urls || [])
+    .map((url) => (url || '').trim())
+    .filter((url) => url && !seen.has(url) && seen.add(url));
+};
+
+export const moveItem = (items, from, to) => {
+  if (to < 0 || to >= items.length) return items;
+  const next = [...items];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+};
+
+export const serverLabel = (index) =>
+  index === 0 ? 'Primary URL' : `Backup URL ${index}`;
+
 export const updatePlaylist = (playlist, values, file) => {
   return API.updatePlaylist({
     id: playlist.id,
@@ -77,6 +102,10 @@ export const prepareSubmitValues = (values, expDate) => {
 
   if (prepared.server_group == '0') {
     prepared.server_group = null;
+  }
+
+  if ('backup_server_urls' in prepared) {
+    prepared.backup_server_urls = cleanBackupUrls(prepared.backup_server_urls);
   }
 
   // hash_key comes from the form as an array of selected fields (MultiSelect).

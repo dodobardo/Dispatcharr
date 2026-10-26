@@ -4,6 +4,7 @@ import useUserAgentsStore from '../../store/userAgents';
 import useServerGroupsStore from '../../store/serverGroups';
 import usePlaylistsStore from '../../store/playlists';
 import M3UProfiles from './M3UProfiles';
+import M3UBackupUrls from './M3UBackupUrls';
 import {
   Box,
   Button,
@@ -64,6 +65,7 @@ const M3U = ({
   const [scheduleType, setScheduleType] = useState('interval');
   const [serverGroupsManagerOpen, setServerGroupsManagerOpen] = useState(false);
   const [hasHashKeyOverride, setHasHashKeyOverride] = useState(false);
+  const [backupUrls, setBackupUrls] = useState([]);
   const [serverGroupsCreateOnOpen, setServerGroupsCreateOnOpen] =
     useState(false);
 
@@ -144,6 +146,7 @@ const M3U = ({
         )
       );
       setExpDate(expDateFromPlaylist(m3uAccount.exp_date));
+      setBackupUrls(m3uAccount.backup_server_urls || []);
 
       // Determine schedule type from existing data
       setScheduleType(
@@ -157,6 +160,7 @@ const M3U = ({
       setScheduleType('interval');
       setExpDate(null);
       setHasHashKeyOverride(false);
+      setBackupUrls([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [m3uAccount]);
@@ -204,12 +208,16 @@ const M3U = ({
 
   const onSubmit = async () => {
     const { create_epg, ...rawValues } = form.getValues();
-    const values = prepareSubmitValues(rawValues, expDate);
+    const values = prepareSubmitValues(
+      { ...rawValues, backup_server_urls: backupUrls },
+      expDate
+    );
 
     if (playlist?.id) {
       await updatePlaylist(playlist, values, file);
       form.reset();
       setFile(null);
+      setBackupUrls([]);
       onClose();
       return;
     }
@@ -221,6 +229,7 @@ const M3U = ({
   const close = () => {
     form.reset();
     setFile(null);
+    setBackupUrls([]);
     setPlaylist(null);
     onClose();
   };
@@ -230,6 +239,7 @@ const M3U = ({
     // After group filter setup for a new account, reset everything
     form.reset();
     setFile(null);
+    setBackupUrls([]);
     setPlaylist(null);
     onClose();
   };
@@ -281,6 +291,21 @@ const M3U = ({
                 description="Direct URL to the M3U playlist or server"
                 {...form.getInputProps('server_url')}
                 key={form.key('server_url')}
+              />
+              <M3UBackupUrls
+                value={backupUrls}
+                onChange={setBackupUrls}
+                accountId={playlist?.id}
+                getTestValues={() => {
+                  const values = form.getValues();
+                  return {
+                    server_url: values.server_url,
+                    account_type: values.account_type,
+                    username: values.username,
+                    password: values.password,
+                    user_agent: values.user_agent,
+                  };
+                }}
               />
               <Select
                 id="account_type"

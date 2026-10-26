@@ -17,6 +17,7 @@ import {
   Text,
   Box,
   ActionIcon,
+  Badge,
   Tooltip,
   Switch,
   Menu,
@@ -344,17 +345,51 @@ const M3UTable = () => {
         size: 250,
         cell: ({ cell, row }) => {
           const value = cell.getValue() || row.original.file_path || '';
+          const backups = cell.getValue()
+            ? row.original.backup_server_urls || []
+            : [];
+          const label = backups.length ? (
+            <div>
+              <div>Primary: {value}</div>
+              {backups.map((url, index) => (
+                <div key={url}>
+                  Backup {index + 1}: {url}
+                </div>
+              ))}
+            </div>
+          ) : (
+            value
+          );
           return (
-            <Tooltip label={value} disabled={!value}>
+            <Tooltip label={label} disabled={!value} multiline maw={500}>
               <div
                 style={{
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
                   maxWidth: '100%',
                 }}
               >
-                {value}
+                <div
+                  style={{
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    minWidth: 0,
+                  }}
+                >
+                  {value}
+                </div>
+                {backups.length > 0 && (
+                  <Badge
+                    size="xs"
+                    variant="light"
+                    color="blue"
+                    style={{ flexShrink: 0 }}
+                  >
+                    +{backups.length} backup{backups.length > 1 ? 's' : ''}
+                  </Badge>
+                )}
               </div>
             </Tooltip>
           );

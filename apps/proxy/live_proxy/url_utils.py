@@ -14,6 +14,12 @@ from apps.m3u.connection_pool import (
     pool_has_capacity_for_profile,
     profile_available_for_channel_switch,
 )
+from apps.m3u.server_urls import (
+    get_account_server_urls,
+    order_server_urls,
+    replace_url_origin,
+    url_origin,
+)
 from .utils import get_logger
 import requests
 
@@ -22,7 +28,116 @@ logger = get_logger()
 
 def _resolve_live_stream_url(stream, m3u_account, m3u_profile):
     """
-    Build the upstream URL for live playback.
+    Upstream URL for live playback on the account's preferred server.
+
+    Returns None when a configured profile transform fails or when STD URL
+    rewrite does not match.
+    """
+    candidates = get_live_stream_url_candidates(stream, m3u_account, m3u_profile)
+    return candidates[0][1] if candidates else None
+
+
+def get_live_stream_url_candidates(stream, m3u_account, m3u_profile) -> List[Tuple[str, str]]:
+    """
+    Upstream URL of *stream* on each of the account's servers.
+
+    Returns ``[(server_url, playback_url), ...]`` with the server that last
+    worked first (see apps.m3u.server_urls), then the primary, then the
+    remaining backups. Accounts without backup URLs get a single entry. Empty
+    when the URL cannot be resolved at all.
+    """
+    primary_url = _resolve_primary_live_stream_url(stream, m3u_account, m3u_profile)
+    if not primary_url:
+        return []
+
+    server_urls = get_account_server_urls(m3u_account)
+    if len(server_urls) < 2:
+        return [(m3u_account.server_url, primary_url)]
+
+    if m3u_account.account_type == M3UAccount.Types.XC and stream.stream_id:
+        from apps.m3u.credentials import build_xc_playback_url, get_transformed_credentials
+        from core.xtream_codes import normalize_server_url
+
+        profile_server, username, password = get_transformed_credentials(
+            m3u_account, m3u_profile
+        )
+        primary_base = normalize_server_url(m3u_account.server_url)
+
+        def url_for_server(server_url):
+            if server_url == m3u_account.server_url:
+                return primary_url
+            base = normalize_server_url(server_url)
+            if profile_server.rstrip("/") != primary_base.rstrip("/"):
+                # The profile points somewhere else; follow it only if it kept the host.
+                if url_origin(profile_server) != url_origin(primary_base):
+                    return None
+                base = replace_url_origin(profile_server, url_origin(base))
+            return build_xc_playback_url(
+                base,
+                username,
+                password,
+                content_path="live",
+                stream_id=str(stream.stream_id),
+                extension="ts",
+            )
+    else:
+        known_origins = {url_origin(url) for url in server_urls}
+
+        def url_for_server(server_url):
+            if server_url == m3u_account.server_url:
+                return primary_url
+            # Streams hosted elsewhere (CDN) have no mirror on the backup server
+            if url_origin(primary_url) not in known_origins:
+                return None
+            return replace_url_origin(primary_url, url_origin(server_url))
+
+    candidates = []
+    seen = set()
+    for server_url in order_server_urls(m3u_account, server_urls):
+        try:
+            url = url_for_server(server_url)
+        except Exception as exc:
+            logger.warning(f"Could not build stream URL for server {url_origin(server_url)}: {exc}")
+            url = None
+        if url and url not in seen:
+            seen.add(url)
+            candidates.append((server_url, url))
+    return candidates
+
+
+def get_server_failover_candidates(stream_id, m3u_profile_id):
+    """
+    Server alternatives for a stream that is already playing.
+
+    Returns ``(account_id, primary_server_url, candidates)`` where candidates is
+    the list from get_live_stream_url_candidates, or None when the stream,
+    profile or account cannot be loaded.
+    """
+    try:
+        stream = Stream.objects.select_related("m3u_account").get(id=stream_id)
+        m3u_profile = M3UAccountProfile.objects.select_related(
+            "m3u_account__user_agent"
+        ).get(id=m3u_profile_id)
+        m3u_account = m3u_profile.m3u_account or stream.m3u_account
+        if not m3u_account:
+            return None
+        return (
+            m3u_account.id,
+            m3u_account.server_url,
+            get_live_stream_url_candidates(stream, m3u_account, m3u_profile),
+        )
+    except (Stream.DoesNotExist, M3UAccountProfile.DoesNotExist):
+        return None
+    except Exception as exc:
+        logger.error(f"Error getting server failover candidates for stream {stream_id}: {exc}")
+        return None
+    finally:
+        close_old_connections()
+
+
+def _resolve_primary_live_stream_url(stream, m3u_account, m3u_profile):
+    """
+    Build the upstream URL for live playback on the account's primary server.
 
     XC accounts use current transformed credentials plus provider stream_id so
     playback matches the account login (not a stale stream.url from an old sync).

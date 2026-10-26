@@ -7,6 +7,8 @@ import {
   prepareSubmitValues,
   expDateFromPlaylist,
   expDateKey,
+  cleanBackupUrls,
+  moveItem,
 } from '../M3uUtils.js';
 
 vi.mock('../../../api.js', () => ({
@@ -22,6 +24,37 @@ import API from '../../../api.js';
 
 describe('M3uUtils', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  // ── Backup server URLs ─────────────────────────────────────────────────────
+
+  describe('cleanBackupUrls', () => {
+    it('trims, drops blanks and duplicates, keeps order', () => {
+      expect(
+        cleanBackupUrls([' http://b:1 ', '', 'http://a:2', 'http://b:1', null])
+      ).toEqual(['http://b:1', 'http://a:2']);
+    });
+
+    it('handles missing input', () => {
+      expect(cleanBackupUrls(undefined)).toEqual([]);
+    });
+  });
+
+  describe('moveItem', () => {
+    it('moves an item and ignores out-of-range targets', () => {
+      expect(moveItem(['a', 'b', 'c'], 2, 0)).toEqual(['c', 'a', 'b']);
+      expect(moveItem(['a', 'b'], 0, -1)).toEqual(['a', 'b']);
+    });
+  });
+
+  describe('prepareSubmitValues backup_server_urls', () => {
+    it('cleans backup URLs before submit', () => {
+      const result = prepareSubmitValues(
+        { account_type: 'XC', backup_server_urls: ['', ' http://b:1 '] },
+        null
+      );
+      expect(result.backup_server_urls).toEqual(['http://b:1']);
+    });
+  });
 
   // ── expDateFromPlaylist / expDateKey ───────────────────────────────────────
 

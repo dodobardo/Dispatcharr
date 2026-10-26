@@ -3,6 +3,8 @@ from rest_framework import serializers, status
 from rest_framework.response import Response
 from .models import M3UAccount, M3UFilter, ServerGroup, M3UAccountProfile
 from .utils import parse_m3u_hash_keys
+from .server_urls import MAX_BACKUP_SERVER_URLS, parse_server_url_list
+from django.core.exceptions import ValidationError as DjangoValidationError
 from core.models import UserAgent
 from apps.channels.models import ChannelGroup, ChannelGroupM3UAccount
 from apps.channels.serializers import (
@@ -117,6 +119,35 @@ class M3UAccountProfileSerializer(serializers.ModelSerializer):
         return super().destroy(request, *args, **kwargs)
 
 
+class BackupServerUrlsField(serializers.Field):
+    """Backup server URLs as a list. Also accepts newline/pipe/comma separated
+    text, which is what multipart (file upload) form submissions send."""
+
+    def to_representation(self, value):
+        return parse_server_url_list(value)
+
+    def to_internal_value(self, data):
+        if data is None:
+            return []
+        if isinstance(data, str):
+            data = data.replace(",", "\n")
+        elif not isinstance(data, (list, tuple)):
+            raise serializers.ValidationError("Expected a list of URLs.")
+        urls = parse_server_url_list(data)
+        if len(urls) > MAX_BACKUP_SERVER_URLS:
+            raise serializers.ValidationError(
+                f"At most {MAX_BACKUP_SERVER_URLS} backup URLs are allowed."
+            )
+        for index, url in enumerate(urls, 1):
+            try:
+                validate_flexible_url(url)
+            except DjangoValidationError:
+                raise serializers.ValidationError(
+                    f"Backup URL #{index} is not a valid URL: {url}"
+                )
+        return urls
+
+
 class M3UAccountSerializer(serializers.ModelSerializer):
     """Serializer for M3U Account"""
 
@@ -145,6 +176,7 @@ class M3UAccountSerializer(serializers.ModelSerializer):
         allow_null=True,
         validators=[validate_flexible_url],
     )
+    backup_server_urls = BackupServerUrlsField(required=False)
     enable_vod = serializers.BooleanField(required=False, write_only=True)
     auto_enable_new_groups_live = serializers.BooleanField(required=False, write_only=True)
     auto_enable_new_groups_vod = serializers.BooleanField(required=False, write_only=True)
@@ -182,6 +214,7 @@ class M3UAccountSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "server_url",
+            "backup_server_urls",
             "file_path",
             "server_group",
             "max_streams",
