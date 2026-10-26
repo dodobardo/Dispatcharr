@@ -47,6 +47,10 @@ ports of the same provider) next to its primary `server_url`.
   URLs), wired into `forms/M3U.jsx` (`backupUrls` state, submitted as
   `backup_server_urls`); `+N backups` badge in `tables/M3UsTable.jsx`;
   `API.testM3UServerUrls` in `api.js`; helpers in `utils/forms/M3uUtils.js`.
+  Stats: `components/cards/StreamConnectionCard.jsx` shows a Primary /
+  Backup N badge next to the M3U profile, from `getActiveServer` in
+  `utils/cards/StreamConnectionCardUtils.js` (matches the channel's current
+  `url` host against the account's servers; only hosts are shown).
 - Tests: `apps/m3u/tests/test_backup_server_urls.py`,
   `apps/proxy/live_proxy/tests/test_server_url_failover.py`, and the backup URL
   cases in `frontend/src/components/forms/__tests__/M3U.test.jsx` and

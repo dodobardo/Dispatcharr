@@ -11,6 +11,48 @@ describe('StreamConnectionCardUtils', () => {
     vi.clearAllMocks();
   });
 
+  describe('getActiveServer', () => {
+    const accounts = [
+      {
+        id: 1,
+        server_url: 'http://primary.tv:8080/player_api.php',
+        backup_server_urls: ['http://backup1.tv', 'http://Backup2.tv:2095/'],
+        profiles: [{ id: 10 }, { id: 11 }],
+      },
+      {
+        id: 2,
+        server_url: 'http://solo.tv',
+        backup_server_urls: [],
+        profiles: [{ id: 20 }],
+      },
+    ];
+    const { getActiveServer } = StreamConnectionCardUtils;
+
+    it('labels the primary and backups by host', () => {
+      expect(
+        getActiveServer('http://primary.tv:8080/live/u/p/1.ts', 10, accounts)
+      ).toMatchObject({ label: 'Primary', host: 'primary.tv:8080', index: 0 });
+      expect(
+        getActiveServer('http://backup2.tv:2095/live/u/p/1.ts', 11, accounts)
+      ).toMatchObject({ label: 'Backup 2', host: 'backup2.tv:2095', index: 2 });
+    });
+
+    it('reports an unknown host', () => {
+      expect(
+        getActiveServer('https://cdn.example/x.m3u8', 10, accounts)
+      ).toMatchObject({ label: 'Other host', index: -1 });
+    });
+
+    it('returns null without backups or data', () => {
+      expect(getActiveServer('http://solo.tv/1.ts', 20, accounts)).toBeNull();
+      expect(getActiveServer('', 10, accounts)).toBeNull();
+      expect(
+        getActiveServer('http://primary.tv:8080/1', 99, accounts)
+      ).toBeNull();
+      expect(getActiveServer('not a url', 10, accounts)).toBeNull();
+    });
+  });
+
   describe('getBufferingSpeedThreshold', () => {
     it('should return parsed buffering_speed from proxy settings', () => {
       const proxySetting = {

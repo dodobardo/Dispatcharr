@@ -34,6 +34,42 @@ export const getM3uAccountsMap = (m3uAccounts) => {
   return map;
 };
 
+const urlHost = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Which of an M3U account's servers a live channel is playing from.
+ *
+ * Only for accounts with backup server URLs; returns null otherwise. The
+ * label is "Primary", "Backup N", or "Other host" (e.g. a CDN the stream
+ * redirects to). Only the host is returned, never the full URL.
+ * @param {string} streamUrl current upstream URL from the stats payload
+ * @param {number} m3uProfileId M3U profile the channel is using
+ * @param {object[]} m3uAccounts playlists from the store
+ * @returns {{label: string, host: string, index: number, servers: string[]}|null}
+ */
+export const getActiveServer = (streamUrl, m3uProfileId, m3uAccounts) => {
+  if (!streamUrl || !m3uProfileId || !Array.isArray(m3uAccounts)) return null;
+  const account = m3uAccounts.find((a) =>
+    (a.profiles || []).some((p) => p.id === m3uProfileId)
+  );
+  const backups = account?.backup_server_urls || [];
+  if (!account?.server_url || backups.length === 0) return null;
+
+  const host = urlHost(streamUrl);
+  if (!host) return null;
+  const servers = [account.server_url, ...backups].map(urlHost);
+  const index = servers.indexOf(host);
+  const label =
+    index === 0 ? 'Primary' : index > 0 ? `Backup ${index}` : 'Other host';
+  return { label, host, index, servers: servers.filter(Boolean) };
+};
+
 export const getChannelStreams = async (channelId) => {
   return await API.getChannelStreams(channelId);
 };

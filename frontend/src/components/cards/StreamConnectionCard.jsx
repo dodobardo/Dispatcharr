@@ -43,6 +43,7 @@ import {
   connectedAccessor,
   durationAccessor,
   getBufferingSpeedThreshold,
+  getActiveServer,
   getChannelStreams,
   getM3uAccountsMap,
   getSelectedStream,
@@ -498,6 +499,12 @@ const StreamConnectionCard = ({
     channel.m3u_profile_name ||
     'Unknown M3U Profile';
 
+  // Which server of the account (primary / backup) the channel is playing from
+  const activeServer = useMemo(
+    () => getActiveServer(channel.url, channel.m3u_profile_id, m3uAccounts),
+    [channel.url, channel.m3u_profile_id, m3uAccounts]
+  );
+
   // Create select options for available streams
   const streamOptions = getStreamOptions(availableStreams, m3uAccountsMap);
 
@@ -604,6 +611,30 @@ const StreamConnectionCard = ({
             <Tooltip label="Current M3U Profile">
               <Text size="xs">{m3uProfileName}</Text>
             </Tooltip>
+            {activeServer && (
+              <Tooltip
+                multiline
+                label={
+                  <div>
+                    <div>Playing from {activeServer.host}</div>
+                    {activeServer.servers.map((host, index) => (
+                      <div key={`${host}-${index}`}>
+                        {index === 0 ? 'Primary' : `Backup ${index}`}: {host}
+                        {index === activeServer.index ? ' ◀' : ''}
+                      </div>
+                    ))}
+                  </div>
+                }
+              >
+                <Badge
+                  size="xs"
+                  variant="light"
+                  color={activeServer.index === 0 ? 'gray' : 'yellow'}
+                >
+                  {activeServer.label}
+                </Badge>
+              </Tooltip>
+            )}
           </Group>
         </Box>
 

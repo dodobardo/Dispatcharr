@@ -46,6 +46,7 @@ vi.mock('../../../utils/notificationUtils.js', () => ({
 vi.mock('../../../utils/cards/StreamConnectionCardUtils.js', () => ({
   connectedAccessor: vi.fn(() => () => '01/01/2024 10:00 AM'),
   durationAccessor: vi.fn(() => () => '5m 30s'),
+  getActiveServer: vi.fn(() => null),
   getBufferingSpeedThreshold: vi.fn(() => 0.9),
   getChannelStreams: vi.fn(() => Promise.resolve([])),
   getLogoUrl: vi.fn(() => null),
