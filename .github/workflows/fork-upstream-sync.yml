@@ -59,7 +59,7 @@ jobs:
           POSTGRES_PASSWORD: secret
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U dispatch" --health-interval 5s
+          --health-cmd "pg_isready -U dispatch -d dispatcharr" --health-interval 5s
           --health-timeout 5s --health-retries 20
       redis:
         image: redis:7
@@ -82,7 +82,7 @@ jobs:
             echo "::warning::No CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY: conflicts will be handed to you as a pull request instead of resolved by Claude."
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -115,13 +115,13 @@ jobs:
             git diff --name-only --diff-filter=U | tee "$RUNNER_TEMP/conflicts.txt"
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: steps.merge.outputs.state != 'up-to-date'
         with:
           python-version: "3.13"
           cache: pip
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.merge.outputs.state != 'up-to-date'
         with:
           node-version: "24"
@@ -133,6 +133,11 @@ jobs:
           git show HEAD:.github/fork/install-python-deps.sh > "$RUNNER_TEMP/install-python-deps.sh"
           bash "$RUNNER_TEMP/install-python-deps.sh" \
             || echo "::warning::Dependency install failed (pyproject may be conflicted); Claude will retry it."
+
+      - name: Prepare /data
+        if: steps.merge.outputs.state != 'up-to-date'
+        # Like the app container, several tests read and write under /data.
+        run: sudo mkdir -p /data && sudo chown "$(id -u):$(id -g)" /data
 
       - name: Verify clean merge
         id: verify_clean
