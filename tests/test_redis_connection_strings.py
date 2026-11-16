@@ -8,6 +8,24 @@ UNIVERSAL_KWARGS = {"decode_responses" : False, "health_check_interval" : 15} #r
 COMMON_TEST_KWARGS = {"host" : "localhost", "port" : 6379, "db" : 0}
 COMMON_SOCKET_KWARGS = {"socket_timeout" : 60, "socket_connect_timeout" : 5, "socket_keepalive" : True}
 
+# redis-py >= 8 injects internal bookkeeping kwargs (hiredis import registry,
+# maintenance-notification handlers, original host/timeouts) into the connection
+# kwargs. They are not derived from REDIS_* env vars, so ignore them here.
+REDIS_PY_INTERNAL_KWARGS = {
+    "himport_registry",
+    "maint_notifications_pool_handler",
+    "maint_notifications_config",
+    "orig_host_address",
+    "orig_socket_timeout",
+    "orig_socket_connect_timeout",
+}
+
+
+def _connection_kwargs(client):
+    total = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+    return {k: v for k, v in total.items() if k not in REDIS_PY_INTERNAL_KWARGS}
+
+
 class RedisConnectionStringsTests(SimpleTestCase):
 
     """
@@ -35,7 +53,7 @@ class RedisConnectionStringsTests(SimpleTestCase):
         with patch.dict(os.environ, {"REDIS_URL":"redis://user@localhost:6379/3"}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
-            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            total_kwargs = _connection_kwargs(client)
             self.assertEqual(EXPECTED_KWARGS_REDIS, total_kwargs)
 
 
@@ -51,7 +69,7 @@ class RedisConnectionStringsTests(SimpleTestCase):
         with patch.dict(os.environ, {"REDIS_URL":"unix:///var/run/test.sock?db=7"}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
-            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            total_kwargs = _connection_kwargs(client)
             self.assertEqual(EXPECTED_KWARGS_UNIX, total_kwargs)
 
     @patch("core.utils.redis.commands.core.CoreCommands.ping")
@@ -66,7 +84,7 @@ class RedisConnectionStringsTests(SimpleTestCase):
         with patch.dict(os.environ, {"REDIS_URL":"rediss://localhost:6379/0?ssl_cert_reqs=none&ssl_ca_certs=/test/testchain.crt&ssl_certfile=/test/test.crt&ssl_keyfile=/test/test.key"}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
-            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            total_kwargs = _connection_kwargs(client)
             self.assertTrue(EXPECTED_KWARGS_REDISS.items() <= total_kwargs.items())
 
     @patch("core.utils.redis.commands.core.CoreCommands.ping")
@@ -84,7 +102,7 @@ class RedisConnectionStringsTests(SimpleTestCase):
                                      "REDIS_DB" : '1'}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
-            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            total_kwargs = _connection_kwargs(client)
             self.assertTrue(EXPECTED_KWARGS_HOSTPORT.items() <= total_kwargs.items())
 
     @patch("core.utils.redis.commands.core.CoreCommands.ping")
@@ -102,5 +120,5 @@ class RedisConnectionStringsTests(SimpleTestCase):
 
             client = RedisClient().get_test_client(max_retries = 1)
             self.assertIsNotNone(client)
-            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            total_kwargs = _connection_kwargs(client)
             self.assertTrue(EXPECTED_KWARGS_HOSTPORT.items() <= total_kwargs.items())
