@@ -53,8 +53,13 @@ class RedisConnectionStringsTests(SimpleTestCase):
         with patch.dict(os.environ, {"REDIS_URL":"redis://user@localhost:6379/3"}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
+<<<<<<< HEAD
             total_kwargs = _connection_kwargs(client)
             self.assertEqual(EXPECTED_KWARGS_REDIS, total_kwargs)
+=======
+            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            self.assertTrue(EXPECTED_KWARGS_REDIS.items() <= total_kwargs.items())
+>>>>>>> 7fa91c1bf9b50062e1791d718bf25ba9daf3ac3f
 
 
     @patch("core.utils.redis.commands.core.CoreCommands.ping")
@@ -69,8 +74,13 @@ class RedisConnectionStringsTests(SimpleTestCase):
         with patch.dict(os.environ, {"REDIS_URL":"unix:///var/run/test.sock?db=7"}, clear=False):
 
             client = RedisClient().get_test_client(max_retries = 1)
+<<<<<<< HEAD
             total_kwargs = _connection_kwargs(client)
             self.assertEqual(EXPECTED_KWARGS_UNIX, total_kwargs)
+=======
+            total_kwargs = client.get_connection_kwargs() | client.connection_pool.connection_kwargs
+            self.assertTrue(EXPECTED_KWARGS_UNIX.items() <= total_kwargs.items())
+>>>>>>> 7fa91c1bf9b50062e1791d718bf25ba9daf3ac3f
 
     @patch("core.utils.redis.commands.core.CoreCommands.ping")
     def test_rediss_url(self, mock_ping):
